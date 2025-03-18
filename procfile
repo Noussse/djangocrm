@@ -1,0 +1,2 @@
+web: gunicorn crmwebsite.wsgi --log-file
+web: manage.py migrate && gunicorn crmwebsite.wsg
