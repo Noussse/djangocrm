@@ -13,36 +13,110 @@ MAX_ATTEMPTS = 5  # Max login attempts
 LOCK_TIME = 300   # Lockout time in seconds (5 minutes)
 
 def home(request):
-    records = Record.objects.all()
+    # Session hijacking prevention
+    if request.user.is_authenticated:
+        # Check if the user's IP address has changed since login
+        current_ip = request.META.get('REMOTE_ADDR')
+        session_ip = request.session.get('user_ip', None)
+        user_agent = request.META.get('HTTP_USER_AGENT')
+        session_user_agent = request.session.get('user_agent', None)
+        
+        # If IP or user agent changed, potential session hijacking
+        if (session_ip and session_ip != current_ip) or (session_user_agent and session_user_agent != user_agent):
+            logout(request)
+            messages.error(request, "Your session has expired for security reasons. Please login again.")
+            return redirect('home')
 
+        # Check session age for inactivity timeout
+        last_activity = request.session.get('last_activity', None)
+        if last_activity:
+            import time
+            current_time = int(time.time())
+            # Timeout after 30 minutes of inactivity
+            if (current_time - last_activity) > 1800:
+                logout(request)
+                messages.error(request, "Your session has expired due to inactivity. Please login again.")
+                return redirect('home')
+        
+        # Update last activity timestamp
+        request.session['last_activity'] = int(time.time())
+    
+    records = Record.objects.all()
+    
     if request.method == 'POST':
         username = request.POST['username']
         password = request.POST['password']
         
+        # Validate inputs (prevent injection attacks)
+        if not username or not password:
+            messages.error(request, "Username and password cannot be empty.")
+            return redirect('home')
+        
         # Rate limiting: check login attempts
         attempts_key = f"login_attempts_{username}"
+        is_locked_key = f"is_locked_{username}"
+        
+        # Check if user is locked
+        if cache.get(is_locked_key):
+            messages.error(request, f"Too many failed attempts. Try again in {LOCK_TIME // 60} minutes.")
+            return redirect('home')
+        
+        # Get attempts count
         attempts = cache.get(attempts_key, 0)
         
-        if attempts >= MAX_ATTEMPTS:
-            lock_time_left = cache.ttl(attempts_key)  # Time remaining for the lock
-            messages.error(request, f"Too many failed attempts. Try again in {lock_time_left // 60} minutes.")
+        # Global rate limiting for the IP to prevent brute force across accounts
+        ip_attempts_key = f"ip_attempts_{request.META.get('REMOTE_ADDR')}"
+        ip_attempts = cache.get(ip_attempts_key, 0)
+        
+        if ip_attempts >= MAX_ATTEMPTS * 2:
+            messages.error(request, "Too many login attempts from this IP address. Please try again later.")
             return redirect('home')
         
         # Authenticate user
         user = authenticate(request, username=username, password=password)
         
         if user is not None:
+            # Check if user account is active
+            if not user.is_active:
+                messages.error(request, "This account has been disabled. Please contact support.")
+                return redirect('home')
+                
             # Reset login attempts after successful login
             cache.delete(attempts_key)
+            cache.delete(is_locked_key)
+            
+            # Log the user in
             login(request, user)
+            
+            # Store identifying information in session
+            request.session['user_ip'] = request.META.get('REMOTE_ADDR')
+            request.session['user_agent'] = request.META.get('HTTP_USER_AGENT')
+            request.session['last_activity'] = int(time.time())
+            
+            # Generate a new session key for added security
+            request.session.cycle_key()
+            
             messages.success(request, "You have been logged in successfully.")
             return redirect('home')
         else:
-            # Increment login attempt counter
-            cache.set(attempts_key, attempts + 1, timeout=LOCK_TIME)  # Set timeout for lock time
-            messages.error(request, "Invalid credentials. Please try again.")
+            # Increment login attempt counter for username
+            attempts += 1
+            cache.set(attempts_key, attempts, timeout=LOCK_TIME)
+            
+            # Increment login attempt counter for IP
+            cache.set(ip_attempts_key, ip_attempts + 1, timeout=LOCK_TIME)
+            
+            # If max attempts reached, lock the account
+            if attempts >= MAX_ATTEMPTS:
+                cache.set(is_locked_key, True, timeout=LOCK_TIME)
+                messages.error(request, f"Too many failed attempts. Account locked for {LOCK_TIME // 60} minutes.")
+            else:
+                messages.error(request, f"Invalid credentials. {MAX_ATTEMPTS - attempts} attempts remaining.")
+            
             return redirect('home')
     else:
+        # Add CSRF token refresh for better security
+        request.META["CSRF_COOKIE_USED"] = True
         return render(request, 'home.html', {'records': records})
 
 def logout_user(request):
