@@ -3,21 +3,47 @@ from django.contrib.auth import authenticate,login,logout
 from django.contrib import messages
 from .forms import SignUpForm,AddRecordForm
 from .models import Record
+from django.contrib.auth import authenticate, login
+from django.contrib import messages
+from django.core.cache import cache
+from django.shortcuts import render, redirect
+from .models import Record
+
+MAX_ATTEMPTS = 5  # Max login attempts
+LOCK_TIME = 300   # Lockout time in seconds (5 minutes)
+
 def home(request):
-    records=Record.objects.all()
-    if request.method=='POST':
-        username=request.POST['username']
-        password=request.POST['password']
-        user=authenticate(request,username=username,password=password)
+    records = Record.objects.all()
+
+    if request.method == 'POST':
+        username = request.POST['username']
+        password = request.POST['password']
+        
+        # Rate limiting: check login attempts
+        attempts_key = f"login_attempts_{username}"
+        attempts = cache.get(attempts_key, 0)
+        
+        if attempts >= MAX_ATTEMPTS:
+            lock_time_left = cache.ttl(attempts_key)  # Time remaining for the lock
+            messages.error(request, f"Too many failed attempts. Try again in {lock_time_left // 60} minutes.")
+            return redirect('home')
+        
+        # Authenticate user
+        user = authenticate(request, username=username, password=password)
+        
         if user is not None:
-            login(request,user)
-            messages.success(request,"you have been logged in ")
+            # Reset login attempts after successful login
+            cache.delete(attempts_key)
+            login(request, user)
+            messages.success(request, "You have been logged in successfully.")
             return redirect('home')
         else:
-            messages.success(request,"there was an error logging in")
+            # Increment login attempt counter
+            cache.set(attempts_key, attempts + 1, timeout=LOCK_TIME)  # Set timeout for lock time
+            messages.error(request, "Invalid credentials. Please try again.")
             return redirect('home')
-    else :
-        return render(request,'home.html',{'records':records})
+    else:
+        return render(request, 'home.html', {'records': records})
 
 def logout_user(request):
     logout(request)
